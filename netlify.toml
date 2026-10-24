@@ -1,8 +1,0 @@
-[build]
-  publish = "public"
-
-[[headers]]
-  for = "/*"
-  [headers.values]
-    Permissions-Policy = "camera=(self)"
-    X-Content-Type-Options = "nosniff"

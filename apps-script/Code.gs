@@ -5,10 +5,10 @@
  * Deploy as Web app: Execute as "Me", access "Anyone".
  */
 const CFG = {
-  API_KEY: 'YOUR_FIREBASE_WEB_API_KEY',
-  PROJECT_ID: 'YOUR_FIREBASE_PROJECT_ID',
-  ROOT_FOLDER_ID: 'YOUR_DRIVE_FOLDER_ID',   // folder that will hold all photos
-  SHEET_ID: 'YOUR_GOOGLE_SHEET_ID'          // backup spreadsheet
+  API_KEY: 'AIzaSyB4gR7_j1RPJLo4rTVZUQO6SvpoHlsJFjY',
+  PROJECT_ID: 'food-management-90588',
+  ROOT_FOLDER_ID: '1Dbpo3_BTPQcPBUsPz4782xqk9mJS9rfw',   // folder that will hold all photos
+  SHEET_ID: '1djuEaY577widnyPoQ3cpK-n-FVs1hglGdxZvsQ2qZJQ'          // backup spreadsheet
 };
 const FS = 'https://firestore.googleapis.com/v1/projects/' + CFG.PROJECT_ID + '/databases/(default)/documents';
 

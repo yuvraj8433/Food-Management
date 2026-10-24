@@ -19,7 +19,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const pad = n => String(n).padStart(2, "0");
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
 const hhmm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-const toEmail = id => `${id.trim().toLowerCase()}@${EMAIL_DOMAIN}`;
+const toEmail = id => id.includes("@") ? id.trim().toLowerCase() : `${id.trim().toLowerCase()}@${EMAIL_DOMAIN}`;
 const $ = (sel, root = document) => root.querySelector(sel);
 const orderId = (date, uid, meal) => `${date}_${uid}_${meal}`;
 
@@ -122,7 +122,12 @@ function loginView(msg = "") {
   $("#f").onsubmit = async e => {
     e.preventDefault();
     try { await signInWithEmailAndPassword(auth, toEmail($("#id").value), $("#pw").value); }
-    catch { $("#err").textContent = "Wrong Employee ID or password."; }
+    catch (err) {
+      const c = err.code || "";
+      $("#err").textContent = c === "auth/invalid-credential" || c === "auth/user-not-found" || c === "auth/wrong-password"
+        ? "Wrong Employee ID or password, or this login was not created in Firebase Authentication."
+        : `Login problem (${c || err.message}). Check Firebase setup.`;
+    }
   };
 }
 

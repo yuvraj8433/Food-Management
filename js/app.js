@@ -12,13 +12,17 @@ const $app = document.getElementById("app");
 
 let me = null;          // current user's profile doc
 let unsub = null;       // active realtime listener
+let tick = null;        // timer that refreshes open/closed state as cut-off times pass
 const DEFAULT_MEALS = [{ id: "lunch", name: "Lunch", cutoff: "10:30" }];
 
 // ---------- helpers ----------
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const pad = n => String(n).padStart(2, "0");
-const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
-const hhmm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+// Date and time are always India time (same as the Firestore rules and the Apps Script), whatever the device timezone is
+const istParts = d => Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hourCycle: "h23",
+  year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).formatToParts(d).map(p => [p.type, p.value]));
+const today = () => { const p = istParts(new Date()); return `${p.year}-${p.month}-${p.day}`; };
+const hhmm = d => { const p = istParts(d); return `${p.hour}:${p.minute}`; };
 const toEmail = id => id.includes("@") ? id.trim().toLowerCase() : `${id.trim().toLowerCase()}@${EMAIL_DOMAIN}`;
 const $ = (sel, root = document) => root.querySelector(sel);
 const orderId = (date, uid, meal) => `${date}_${uid}_${meal}`;
@@ -27,13 +31,23 @@ function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
   clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 3000);
 }
-function stopListening() { if (unsub) { unsub(); unsub = null; } }
+function stopListening() { if (unsub) { unsub(); unsub = null; } clearInterval(tick); }
 
 async function getConfig() {
   const s = await getDoc(doc(db, "settings", "config"));
   return s.exists() && s.data().meals?.length ? s.data() : { meals: DEFAULT_MEALS };
 }
 const pastCutoff = meal => hhmm(new Date()) > (meal.cutoff || "23:59");
+// The Firestore rules cannot loop over the meals array, so they read these lookup maps instead
+const ruleMaps = meals => ({
+  cutoffs: Object.fromEntries(meals.map(m => [m.id, m.cutoff || "23:59"])),
+  names: Object.fromEntries(meals.map(m => [m.id, m.name]))
+});
+async function syncRuleConfig(cfg) {
+  if (cfg.cutoffs && cfg.names) return;
+  await setDoc(doc(db, "settings", "config"), { meals: cfg.meals, ...ruleMaps(cfg.meals) });
+  cfg.cutoffs = true; cfg.names = true;
+}
 
 // ---------- Apps Script bridge (Drive storage) ----------
 async function api(action, payload) {
@@ -104,14 +118,37 @@ function showPhoto(fileId, title) {
 onAuthStateChanged(auth, async user => {
   stopListening();
   if (!user) { me = null; return loginView(); }
-  const s = await getDoc(doc(db, "users", user.uid));
+  let s;
+  try { s = await getDoc(doc(db, "users", user.uid)); }
+  catch (e) { await signOut(auth); return loginView("Could not load your profile (" + (e.code || e.message) + "). Try again."); }
   if (!s.exists() || s.data().active === false) {
     await signOut(auth);
     return loginView("This account is not active. Contact admin.");
   }
   me = { uid: user.uid, ...s.data() };
+  if (me.mustChangePw) return forcePasswordView();
   me.role === "admin" ? adminView() : employeeView();
 });
+
+// First login with an admin-issued password: choose your own before using the app
+function forcePasswordView() {
+  $app.innerHTML = `<div class="card login"><h2 class="center" style="margin-top:0">Set a new password</h2>
+    <p class="small muted">Your password was issued by the admin. Choose your own to continue.</p>
+    <form id="f"><label>New password (min 8 characters)</label><input id="np" type="password" minlength="8" required autocomplete="new-password">
+    <label>Repeat password</label><input id="np2" type="password" minlength="8" required autocomplete="new-password">
+    <p class="small" style="color:var(--bad)" id="err"></p>
+    <button class="primary" style="width:100%">Save password</button> <button type="button" id="out" style="width:100%;margin-top:8px">Sign out</button></form></div>`;
+  $("#out").onclick = () => signOut(auth);
+  $("#f").onsubmit = async e => {
+    e.preventDefault();
+    if ($("#np").value !== $("#np2").value) return $("#err").textContent = "Passwords do not match.";
+    try {
+      await updatePassword(auth.currentUser, $("#np").value);
+      await updateDoc(doc(db, "users", me.uid), { mustChangePw: false }); me.mustChangePw = false;
+      me.role === "admin" ? adminView() : employeeView();
+    } catch (err) { $("#err").textContent = err.code === "auth/requires-recent-login" ? "Sign out and sign in again, then retry." : err.message; }
+  };
+}
 
 function loginView(msg = "") {
   $app.innerHTML = `<div class="card login"><h2 class="center" style="margin-top:0">Air Flow Pvt. Ltd.<br><small class="muted">Food Desk</small></h2>
@@ -149,23 +186,27 @@ function employeeView(tab = "order") {
 async function employeeOrder(body) {
   const cfg = await getConfig(), date = today();
   const q = query(collection(db, "orders"), where("uid", "==", me.uid), where("date", "==", date));
-  unsub = onSnapshot(q, snap => {
+  stopListening();   // the awaits above may have let a stale listener be registered
+  let last = null;
+  const render = snap => {
     const mine = Object.fromEntries(snap.docs.map(d => [d.data().meal, { id: d.id, ...d.data() }]));
-    body.innerHTML = `<p class="muted">${new Date().toDateString()}. Order before the cut-off time. A live photo is required.</p>` +
+    body.innerHTML = `<p class="muted">${date}. Order before the cut-off time. A live photo is required.</p>` +
       cfg.meals.map(m => {
         const o = mine[m.id], late = pastCutoff(m);
         return `<div class="card"><div class="row"><div><b>${esc(m.name)}</b><div class="small muted">Order until ${esc(m.cutoff)}</div></div>
           <div style="text-align:right">${o
-            ? `<span class="badge ok">Ordered</span> <button data-cancel="${o.id}" ${late ? "disabled" : ""}>Cancel</button>`
-            : late ? `<span class="badge bad">Closed</span>` : `<button class="primary" data-order="${m.id}">I need food</button>`}</div></div>
-          ${o?.photoFileId ? `<button class="small" data-view="${o.photoFileId}">View my photo</button>` : ""}</div>`;
+            ? `<span class="badge ok">Ordered</span> <button data-cancel="${esc(o.id)}" ${late ? "disabled" : ""}>Cancel</button>`
+            : late ? `<span class="badge bad">Closed</span>` : `<button class="primary" data-order="${esc(m.id)}">I need food</button>`}</div></div>
+          ${o?.photoFileId ? `<button class="small" data-view="${esc(o.photoFileId)}">View my photo</button>` : ""}</div>`;
       }).join("");
     body.querySelectorAll("[data-order]").forEach(b => b.onclick = () => placeOrder(cfg.meals.find(m => m.id === b.dataset.order)));
     body.querySelectorAll("[data-cancel]").forEach(b => b.onclick = async () => {
       if (confirm("Cancel this order?")) { await deleteDoc(doc(db, "orders", b.dataset.cancel)); toast("Order cancelled"); }
     });
     body.querySelectorAll("[data-view]").forEach(b => b.onclick = () => showPhoto(b.dataset.view, "Order photo"));
-  }, err => toast(err.message));
+  };
+  unsub = onSnapshot(q, snap => { last = snap; render(snap); }, err => toast(err.message));
+  tick = setInterval(() => last && render(last), 30000);   // "Closed" and the disabled Cancel button appear on time
 }
 
 async function placeOrder(meal) {
@@ -187,15 +228,15 @@ async function placeOrder(meal) {
 
 async function employeeProfile(body) {
   const hist = await getDocs(query(collection(db, "orders"), where("uid", "==", me.uid)));
-  const rows = hist.docs.map(d => d.data()).sort((a, b) => b.date.localeCompare(a.date));
+  const rows = hist.docs.map(d => d.data()).sort((a, b) => String(b.date ?? "").localeCompare(String(a.date ?? "")));
   const month = today().slice(0, 7);
   body.innerHTML = `<div class="card"><div class="row" style="align-items:center">
       <div style="flex:0 0 auto;min-width:0"><img class="avatar" id="av" alt=""></div>
       <div><h3 style="margin:0">${esc(me.name)}</h3><div class="muted">ID: ${esc(me.empId)} · ${esc(me.dept || "—")}</div>
-      <div class="muted">${esc(me.phone || "")}</div><div class="small">Meals this month: <b>${rows.filter(r => r.date.startsWith(month)).length}</b></div></div></div>
+      <div class="muted">${esc(me.phone || "")}</div><div class="small">Meals this month: <b>${rows.filter(r => String(r.date).startsWith(month)).length}</b></div></div></div>
       <div class="row" style="margin-top:10px"><button id="chPhoto">Update profile photo</button><button id="chPw">Change password</button></div></div>
     <div class="card"><h3 style="margin-top:0">My order history</h3><div class="tablewrap"><table><tr><th>Date</th><th>Meal</th><th>Photo</th></tr>
-    ${rows.map(r => `<tr><td>${r.date}</td><td>${esc(r.mealName || r.meal)}</td><td>${r.photoFileId ? `<button data-view="${r.photoFileId}">View</button>` : "—"}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">No orders yet</td></tr>`}</table></div></div>`;
+    ${rows.map(r => `<tr><td>${esc(r.date)}</td><td>${esc(r.mealName || r.meal)}</td><td>${r.photoFileId ? `<button data-view="${esc(r.photoFileId)}">View</button>` : "—"}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">No orders yet</td></tr>`}</table></div></div>`;
   if (me.photoFileId) photoSrc(me.photoFileId).then(s => $("#av").src = s).catch(() => {});
   body.querySelectorAll("[data-view]").forEach(b => b.onclick = () => showPhoto(b.dataset.view, "Order photo"));
   $("#chPhoto").onclick = async () => {
@@ -228,26 +269,30 @@ async function loadEmployees() {
 
 async function adminToday(body) {
   const cfg = await getConfig(), date = today(), emps = await loadEmployees();
+  await syncRuleConfig(cfg).catch(e => toast("Could not update meal settings: " + e.message));
+  stopListening();
   unsub = onSnapshot(query(collection(db, "orders"), where("date", "==", date)), snap => {
-    const orders = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const orders = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")));
     const count = id => orders.filter(o => o.meal === id).length;
     const ordered = new Set(orders.map(o => o.uid));
     body.innerHTML = `<div class="grid">${cfg.meals.map(m => `<div class="card stat"><b>${count(m.id)}</b>${esc(m.name)}</div>`).join("")}
-      <div class="card stat"><b>${emps.filter(e => e.active !== false).length - [...ordered].filter(u => emps.some(e => e.uid === u)).length}</b>Not ordered</div></div>
+      <div class="card stat"><b>${emps.filter(e => e.active !== false && !ordered.has(e.uid)).length}</b>Not ordered</div></div>
       <div class="card"><h3 style="margin-top:0">Add an order manually</h3><div class="row">
-        <div><label>Employee</label><select id="aoEmp">${emps.filter(e => e.active !== false).map(e => `<option value="${e.uid}">${esc(e.name)} (${esc(e.empId)})</option>`).join("")}</select></div>
-        <div><label>Meal</label><select id="aoMeal">${cfg.meals.map(m => `<option value="${m.id}">${esc(m.name)}</option>`).join("")}</select></div>
+        <div><label>Employee</label><select id="aoEmp">${emps.filter(e => e.active !== false).map(e => `<option value="${esc(e.uid)}">${esc(e.name)} (${esc(e.empId)})</option>`).join("")}</select></div>
+        <div><label>Meal</label><select id="aoMeal">${cfg.meals.map(m => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("")}</select></div>
         <button class="primary" id="aoAdd">Add</button></div></div>
       <div class="card"><h3 style="margin-top:0">Orders – ${date}</h3><div class="tablewrap"><table><tr><th>Emp ID</th><th>Name</th><th>Dept</th><th>Meal</th><th>Time</th><th>Photo</th><th></th></tr>
       ${orders.map(o => `<tr><td>${esc(o.empId)}</td><td>${esc(o.name)}</td><td>${esc(o.dept)}</td><td>${esc(o.mealName || o.meal)}</td>
-        <td>${new Date(o.createdAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}${o.source === "admin" ? ' <span class="badge">admin</span>' : ""}</td>
-        <td>${o.photoFileId ? `<button data-view="${o.photoFileId}">View</button>` : "—"}</td><td><button class="danger" data-del="${o.id}">Remove</button></td></tr>`).join("") || `<tr><td colspan="7" class="muted">No orders yet</td></tr>`}</table></div></div>`;
+        <td>${new Date(o.createdAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })}${o.source === "admin" ? ' <span class="badge">admin</span>' : ""}</td>
+        <td>${o.photoFileId ? `<button data-view="${esc(o.photoFileId)}">View</button>` : "—"}</td><td><button class="danger" data-del="${esc(o.id)}">Remove</button></td></tr>`).join("") || `<tr><td colspan="7" class="muted">No orders yet</td></tr>`}</table></div></div>`;
     body.querySelectorAll("[data-view]").forEach(b => b.onclick = () => showPhoto(b.dataset.view, "Order photo"));
     body.querySelectorAll("[data-del]").forEach(b => b.onclick = () => deleteDoc(doc(db, "orders", b.dataset.del)).then(() => toast("Removed")));
     const add = $("#aoAdd"); if (add) add.onclick = async () => {
       const e = emps.find(x => x.uid === $("#aoEmp").value), m = cfg.meals.find(x => x.id === $("#aoMeal").value);
-      if (!e) return;
-      await setDoc(doc(db, "orders", orderId(date, e.uid, m.id)), {
+      if (!e || !m) return;
+      const id = orderId(date, e.uid, m.id);
+      if ((await getDoc(doc(db, "orders", id))).exists() && !confirm(`${e.name} already has this order. Replace it? Their photo link will be lost.`)) return;
+      await setDoc(doc(db, "orders", id), {
         date, uid: e.uid, empId: e.empId, name: e.name, dept: e.dept || "", meal: m.id, mealName: m.name,
         photoFileId: "", source: "admin", createdAt: new Date().toISOString(), synced: false
       });
@@ -256,27 +301,43 @@ async function adminToday(body) {
   }, err => toast(err.message));
 }
 
+function genPassword() {
+  const chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no look-alike characters
+  return Array.from(crypto.getRandomValues(new Uint32Array(10)), n => chars[n % chars.length]).join("");
+}
+
 async function adminEmployees(body) {
   const emps = await loadEmployees();
   body.innerHTML = `<div class="card"><h3 style="margin-top:0">Add employee</h3><form id="f"><div class="row">
       <div><label>Employee ID</label><input id="eId" required></div><div><label>Name</label><input id="eName" required></div>
       <div><label>Department</label><input id="eDept"></div><div><label>Phone</label><input id="ePhone"></div>
-      <div><label>Initial password</label><input id="ePw" required minlength="6"></div><button class="primary">Add</button></div></form></div>
+      <div><label>Initial password (employee must change it at first login)</label><input id="ePw" required minlength="8" value="${esc(genPassword())}"></div><button class="primary">Add</button></div></form></div>
     <div class="card"><h3 style="margin-top:0">Employees (${emps.length})</h3><div class="tablewrap"><table><tr><th>ID</th><th>Name</th><th>Dept</th><th>Phone</th><th>Status</th><th></th></tr>
     ${emps.map(e => `<tr><td>${esc(e.empId)}</td><td>${esc(e.name)}</td><td>${esc(e.dept)}</td><td>${esc(e.phone)}</td>
       <td><span class="badge ${e.active === false ? "bad" : "ok"}">${e.active === false ? "Disabled" : "Active"}</span></td>
-      <td><button data-tog="${e.uid}">${e.active === false ? "Enable" : "Disable"}</button> <button class="danger" data-rm="${e.uid}">Remove</button></td></tr>`).join("")}</table></div></div>`;
+      <td><button data-tog="${esc(e.uid)}">${e.active === false ? "Enable" : "Disable"}</button> <button class="danger" data-rm="${esc(e.uid)}">Remove</button></td></tr>`).join("")}</table></div></div>`;
   $("#f").onsubmit = async ev => {
     ev.preventDefault();
-    const empId = $("#eId").value.trim(), secondary = initializeApp(firebaseConfig, "secondary-" + Date.now());
+    const empId = $("#eId").value.trim(), pw = $("#ePw").value;
+    if (!/^[A-Za-z0-9._-]{2,30}$/.test(empId)) return toast("Employee ID: letters, numbers . _ - only (2–30 characters)");
+    const secondary = initializeApp(firebaseConfig, "secondary-" + Date.now());
     try {
       // secondary app so the admin stays signed in while the new account is created
-      const cred = await createUserWithEmailAndPassword(getAuth(secondary), toEmail(empId), $("#ePw").value);
+      const sauth = getAuth(secondary);
+      let cred;
+      try { cred = await createUserWithEmailAndPassword(sauth, toEmail(empId), pw); }
+      catch (err) {
+        if (err.code !== "auth/email-already-in-use") throw err;
+        // a login left behind by a half-finished earlier attempt: reuse it only if the password matches and it has no profile
+        cred = await signInWithEmailAndPassword(sauth, toEmail(empId), pw).catch(() => null);
+        if (!cred || (await getDoc(doc(db, "users", cred.user.uid))).exists()) throw err;
+      }
       await setDoc(doc(db, "users", cred.user.uid), {
         empId, name: $("#eName").value.trim(), dept: $("#eDept").value.trim(), phone: $("#ePhone").value.trim(),
-        role: "employee", active: true, photoFileId: "", createdAt: new Date().toISOString()
+        role: "employee", active: true, mustChangePw: true, photoFileId: "", createdAt: new Date().toISOString()
       });
-      toast("Employee added"); adminView("employees");
+      alert(`Employee added.\n\nEmployee ID: ${empId}\nInitial password: ${pw}\n\nShare this with the employee. They must set their own password at first login.`);
+      adminView("employees");
     } catch (e) { toast(e.code === "auth/email-already-in-use" ? "That Employee ID already exists" : e.message); }
     finally { await getAuth(secondary).signOut(); deleteApp(secondary); }
   };
@@ -298,7 +359,7 @@ async function adminReports(body) {
   let rows = [];
   $("#go").onclick = async () => {
     const s = await getDocs(query(collection(db, "orders"), where("date", ">=", $("#from").value), where("date", "<=", $("#to").value)));
-    rows = s.docs.map(x => x.data()).sort((a, b) => a.date.localeCompare(b.date) || a.empId.localeCompare(b.empId));
+    rows = s.docs.map(x => x.data()).sort((a, b) => String(a.date ?? "").localeCompare(String(b.date ?? "")) || String(a.empId ?? "").localeCompare(String(b.empId ?? "")));
     const per = {};
     rows.forEach(r => { (per[r.empId] ??= { name: r.name, n: 0 }).n++; });
     $("#csv").disabled = !rows.length;
@@ -306,7 +367,8 @@ async function adminReports(body) {
       ${Object.entries(per).map(([id, p]) => `<tr><td>${esc(id)}</td><td>${esc(p.name)}</td><td>${p.n}</td></tr>`).join("")}</table></div></div>`;
   };
   $("#csv").onclick = () => {
-    const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    // a leading ' stops Excel/Sheets from running cells that start with = + - @ as formulas
+    const q = v => { let s = String(v ?? ""); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return `"${s.replace(/"/g, '""')}"`; };
     const csv = ["Date,EmpID,Name,Dept,Meal,Source"].concat(rows.map(r => [r.date, r.empId, r.name, r.dept, r.mealName || r.meal, r.source].map(q).join(","))).join("\n");
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
     a.download = `food-orders-${$("#from").value}_${$("#to").value}.csv`; a.click();
@@ -327,7 +389,9 @@ async function adminSettings(body) {
     $("#add").onclick = () => { meals.push({ id: "m" + Date.now().toString(36), name: "New meal", cutoff: "10:30" }); draw(); };
     $("#save").onclick = async () => {
       if (!meals.length) return toast("Keep at least one meal");
-      await setDoc(doc(db, "settings", "config"), { meals }); toast("Saved");
+      if (meals.some(m => !m.name.trim() || !/^\d\d:\d\d$/.test(m.cutoff || ""))) return toast("Every meal needs a name and a cut-off time");
+      meals.forEach(m => m.name = m.name.trim());
+      await setDoc(doc(db, "settings", "config"), { meals, ...ruleMaps(meals) }); toast("Saved");
     };
   };
   draw();

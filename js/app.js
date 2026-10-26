@@ -151,7 +151,7 @@ function forcePasswordView() {
 }
 
 function loginView(msg = "") {
-  $app.innerHTML = `<div class="card login"><h2 class="center" style="margin-top:0">Air Flow Pvt. Ltd.<br><small class="muted">Food Desk</small></h2>
+  $app.innerHTML = `<div class="card login"><div class="logo">🍽</div><h2>Air Flow Pvt. Ltd.<small>Food Desk</small></h2>
     <form id="f"><label>Employee ID</label><input id="id" required autocomplete="username">
     <label>Password</label><input id="pw" type="password" required autocomplete="current-password">
     <p class="small" style="color:var(--bad)" id="err">${esc(msg)}</p>
@@ -169,7 +169,7 @@ function loginView(msg = "") {
 }
 
 function shell(title, tabs, active) {
-  $app.innerHTML = `<header class="top"><h1>${esc(title)}</h1><span class="small muted">${esc(me.name)} (${esc(me.empId)}) <button id="out">Sign out</button></span></header>
+  $app.innerHTML = `<header class="top"><div class="who"><h1>${esc(title)}</h1><div class="small">${esc(me.name)} (${esc(me.empId)})</div></div><button id="out">Sign out</button></header>
     <div class="tabs">${tabs.map(([k, n]) => `<button data-t="${k}" class="${k === active ? "active" : ""}">${n}</button>`).join("")}</div><div id="body"></div>`;
   $("#out").onclick = () => signOut(auth);
   return $("#body");
@@ -193,7 +193,7 @@ async function employeeOrder(body) {
     body.innerHTML = `<p class="muted">${date}. Order before the cut-off time. A live photo is required.</p>` +
       cfg.meals.map(m => {
         const o = mine[m.id], late = pastCutoff(m);
-        return `<div class="card"><div class="row"><div><b>${esc(m.name)}</b><div class="small muted">Order until ${esc(m.cutoff)}</div></div>
+        return `<div class="card meal"><div class="row" style="align-items:center"><div><b style="font-size:18px">${esc(m.name)}</b><div class="small muted">Order until ${esc(m.cutoff)}</div></div>
           <div style="text-align:right">${o
             ? `<span class="badge ok">Ordered</span> <button data-cancel="${esc(o.id)}" ${late ? "disabled" : ""}>Cancel</button>`
             : late ? `<span class="badge bad">Closed</span>` : `<button class="primary" data-order="${esc(m.id)}">I need food</button>`}</div></div>
